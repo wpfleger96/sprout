@@ -931,9 +931,18 @@ class _ChannelTile extends ConsumerWidget {
                 key: Key('channel-unread-${channel.id}'),
                 width: 8,
                 height: 8,
+                alignment: Alignment.center,
                 decoration: BoxDecoration(
-                  color: context.colors.primary,
+                  border: Border.all(color: context.colors.primary, width: 1.5),
                   shape: BoxShape.circle,
+                ),
+                child: Container(
+                  width: 3,
+                  height: 3,
+                  decoration: BoxDecoration(
+                    color: context.colors.primary,
+                    shape: BoxShape.circle,
+                  ),
                 ),
               ),
             ],
