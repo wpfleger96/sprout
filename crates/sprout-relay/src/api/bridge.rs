@@ -257,6 +257,12 @@ pub async fn query_events(
             "restricted: agent-engram reads require authors=[self] or #p=[self]",
         ));
     }
+    if !crate::handlers::req::author_only_filters_authorized(&filters, &authed_pubkey_hex) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: author-only kinds require authors=[self]",
+        ));
+    }
 
     // Get channels this user can access — same enforcement as WS REQ handler.
     let accessible_channels = state
@@ -266,8 +272,14 @@ pub async fn query_events(
 
     // ── NIP-50 search: route to Typesense if any filter has a `search` field ──
     if filters.iter().any(|f| f.search.is_some()) {
-        return handle_bridge_search(&state, &filters, &accessible_channels, &authed_pubkey_hex)
-            .await;
+        return handle_bridge_search(
+            &state,
+            &filters,
+            &accessible_channels,
+            &authed_pubkey_hex,
+            &pubkey_bytes,
+        )
+        .await;
     }
 
     // ── Presence: synthesize kind:20001 from Redis (ephemeral, never in DB) ──
@@ -447,6 +459,9 @@ pub async fn query_events(
                     ) {
                         continue;
                     }
+                    if crate::handlers::req::is_author_only_event(&se.event, &pubkey_bytes) {
+                        continue;
+                    }
                     if let Ok(v) = serde_json::to_value(&se.event) {
                         events.push(v);
                     }
@@ -503,6 +518,12 @@ pub async fn count_events(
             "restricted: agent-engram reads require authors=[self] or #p=[self]",
         ));
     }
+    if !crate::handlers::req::author_only_filters_authorized(&filters, &authed_pubkey_hex) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: author-only kinds require authors=[self]",
+        ));
+    }
 
     // Get channels this user can access.
     let accessible_channels = state
@@ -512,6 +533,9 @@ pub async fn count_events(
 
     let mut total: u64 = 0;
     for filter in &filters {
+        let needs_author_only_filtering =
+            crate::handlers::req::filter_can_match_author_only_kinds(filter);
+
         // If filter targets a specific channel, verify access.
         if let Some(ch_id) = extract_channel_from_filter(filter) {
             if !accessible_channels.contains(&ch_id) {
@@ -521,7 +545,15 @@ pub async fn count_events(
             let query =
                 crate::handlers::req::build_event_query_from_filter(filter, &pubkey_bytes, &state)
                     .await;
-            if crate::handlers::req::filter_fully_pushable(filter) {
+            let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
+                !authors.is_empty()
+                    && authors
+                        .iter()
+                        .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
+            });
+            if crate::handlers::req::filter_fully_pushable(filter)
+                && (!needs_author_only_filtering || author_is_self)
+            {
                 match state.db.count_events(&query).await {
                     Ok(n) => total += n as u64,
                     Err(e) => {
@@ -536,10 +568,17 @@ pub async fn count_events(
                 match state.db.query_events(&q).await {
                     Ok(stored_events) => {
                         for se in stored_events {
-                            if sprout_core::filter::filters_match(std::slice::from_ref(filter), &se)
-                            {
-                                total += 1;
+                            if !sprout_core::filter::filters_match(
+                                std::slice::from_ref(filter),
+                                &se,
+                            ) {
+                                continue;
                             }
+                            if crate::handlers::req::is_author_only_event(&se.event, &pubkey_bytes)
+                            {
+                                continue;
+                            }
+                            total += 1;
                         }
                     }
                     Err(e) => {
@@ -555,7 +594,15 @@ pub async fn count_events(
                     .await;
             query.channel_ids = Some(accessible_channels.to_vec());
 
-            if crate::handlers::req::filter_fully_pushable(filter) {
+            let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
+                !authors.is_empty()
+                    && authors
+                        .iter()
+                        .all(|a| a.to_hex().eq_ignore_ascii_case(&authed_pubkey_hex))
+            });
+            if crate::handlers::req::filter_fully_pushable(filter)
+                && (!needs_author_only_filtering || author_is_self)
+            {
                 query.limit = None;
                 match state.db.count_events(&query).await {
                     Ok(n) => total += n as u64,
@@ -570,10 +617,17 @@ pub async fn count_events(
                 match state.db.query_events(&query).await {
                     Ok(stored_events) => {
                         for se in stored_events {
-                            if sprout_core::filter::filters_match(std::slice::from_ref(filter), &se)
-                            {
-                                total += 1;
+                            if !sprout_core::filter::filters_match(
+                                std::slice::from_ref(filter),
+                                &se,
+                            ) {
+                                continue;
                             }
+                            if crate::handlers::req::is_author_only_event(&se.event, &pubkey_bytes)
+                            {
+                                continue;
+                            }
+                            total += 1;
                         }
                     }
                     Err(e) => {
@@ -628,6 +682,7 @@ async fn handle_bridge_search(
     filters: &[nostr::Filter],
     accessible_channels: &[uuid::Uuid],
     reader_pubkey_hex: &str,
+    pubkey_bytes: &[u8],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Bridge always includes global (non-channel) events — same as WS with full scopes.
     let channel_scope = match crate::handlers::req::build_search_channel_scope_filter(
@@ -742,6 +797,9 @@ async fn handle_bridge_search(
                 None => continue,
             };
             if !search_hit_accepted(filter, stored, accessible_channels, reader_pubkey_hex) {
+                continue;
+            }
+            if crate::handlers::req::is_author_only_event(&stored.event, pubkey_bytes) {
                 continue;
             }
             // Dedup across filters.
