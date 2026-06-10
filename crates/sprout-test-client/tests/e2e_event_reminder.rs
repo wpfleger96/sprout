@@ -1012,6 +1012,140 @@ async fn test_ws_count_returns_zero_for_other_users_reminders() {
     ws_other.disconnect().await.expect("disconnect");
 }
 
+// ── Scheduler push delivery tests ────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore]
+async fn test_scheduler_delivers_due_reminder_to_author_subscription() {
+    // Verifies the full scheduler delivery path:
+    // 1. Author opens a live WS subscription for kind:30300
+    // 2. A reminder with `not_before` in the past is published
+    // 3. The scheduler tick picks it up and publishes via Redis pub/sub
+    // 4. The author receives the event on their live subscription
+    // 5. A non-author user does NOT receive it
+    //
+    // Requires the relay to be running with the scheduler enabled.
+    // Set SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=2 for faster feedback.
+    let url = relay_url();
+    let author_keys = Keys::generate();
+    let other_keys = Keys::generate();
+
+    // Connect both users and open subscriptions BEFORE the reminder is published.
+    let mut ws_author = SproutTestClient::connect(&url, &author_keys)
+        .await
+        .expect("connect author");
+    let mut ws_other = SproutTestClient::connect(&url, &other_keys)
+        .await
+        .expect("connect other");
+
+    let author_sid = sub_id("sched-author");
+    let other_sid = sub_id("sched-other");
+
+    // Author subscribes to their own reminders
+    let author_filter = Filter::new()
+        .kind(Kind::Custom(KIND_EVENT_REMINDER))
+        .author(author_keys.public_key());
+    ws_author
+        .subscribe(&author_sid, vec![author_filter])
+        .await
+        .expect("author subscribe");
+
+    // Other user subscribes with a wildcard (should still not receive author-only events)
+    let other_filter = Filter::new();
+    ws_other
+        .subscribe(&other_sid, vec![other_filter])
+        .await
+        .expect("other subscribe");
+
+    // Drain EOSE for both
+    let _author_historical = ws_author
+        .collect_until_eose(&author_sid, Duration::from_secs(5))
+        .await
+        .expect("author drain EOSE");
+    let _other_historical = ws_other
+        .collect_until_eose(&other_sid, Duration::from_secs(5))
+        .await
+        .expect("other drain EOSE");
+
+    // Publish a reminder with not_before set to 5 seconds ago (already due).
+    // The scheduler should pick this up on its next tick.
+    let not_before_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 5;
+    let d_tag = uuid::Uuid::new_v4().to_string();
+    let client = http_client();
+    let reminder = build_reminder(
+        &author_keys,
+        &d_tag,
+        vec![Tag::parse(["not_before", &not_before_ts.to_string()]).unwrap()],
+    );
+    let reminder_event_id = reminder.id.to_hex();
+    let (accepted, msg) = submit_event_http(&client, &author_keys, &reminder).await;
+    assert!(accepted, "reminder submission failed: {msg}");
+
+    // Wait for the scheduler to deliver. Default interval is 10s, but tests
+    // should set SPROUT_REMINDER_SCHEDULER_INTERVAL_SECS=2. We wait up to 15s.
+    let mut received_reminder = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            break;
+        }
+
+        match ws_author.recv_event(remaining).await {
+            Ok(RelayMessage::Event {
+                subscription_id,
+                event,
+            }) if subscription_id == author_sid => {
+                if event.id.to_hex() == reminder_event_id {
+                    received_reminder = true;
+                    break;
+                }
+            }
+            Ok(_) => {
+                // Other messages (NOTICE, events from other subscriptions) — skip
+            }
+            Err(sprout_test_client::TestClientError::Timeout) => break,
+            Err(e) => panic!("unexpected error waiting for scheduler delivery: {e}"),
+        }
+    }
+
+    assert!(
+        received_reminder,
+        "author should receive due reminder via scheduler push delivery within 15s"
+    );
+
+    // Verify the non-author user did NOT receive the reminder.
+    // Give a brief window for any stray fan-out.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let result = ws_other.recv_event(Duration::from_secs(2)).await;
+    match result {
+        Err(sprout_test_client::TestClientError::Timeout) => {
+            // Expected: no event delivered to non-author
+        }
+        Ok(RelayMessage::Event { event, .. }) => {
+            assert_ne!(
+                event.kind,
+                Kind::Custom(KIND_EVENT_REMINDER),
+                "non-author should NOT receive reminder via scheduler push delivery"
+            );
+        }
+        Ok(_) => {
+            // Other message types are fine
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+
+    ws_author.disconnect().await.expect("disconnect author");
+    ws_other.disconnect().await.expect("disconnect other");
+}
+
 #[tokio::test]
 #[ignore]
 async fn test_reminder_rejected_not_before_too_far_in_future() {
