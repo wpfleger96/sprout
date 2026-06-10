@@ -885,6 +885,56 @@ fn validate_engram_envelope(event: &Event) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate the envelope of a kind:30175 persona event.
+///
+/// Enforces:
+/// * exactly one `d` tag with a non-empty value matching the slug grammar
+///   `^[a-z0-9][a-z0-9_-]{0,63}$`.
+///
+/// Without this, an empty d-tag collapses every persona into the
+/// `(pubkey, 30175, "")` slot — last-write-wins data loss.
+fn validate_persona_envelope(event: &Event) -> Result<(), String> {
+    let mut d_tags: Vec<&str> = Vec::new();
+    for tag in event.tags.iter() {
+        let parts = tag.as_slice();
+        if parts.len() >= 2 && parts[0].as_str() == "d" {
+            d_tags.push(&parts[1]);
+        }
+    }
+    if d_tags.len() != 1 {
+        return Err(format!(
+            "persona event must have exactly one `d` tag (got {})",
+            d_tags.len()
+        ));
+    }
+    let d = d_tags[0];
+    if d.is_empty() {
+        return Err("persona event `d` tag must not be empty".to_string());
+    }
+    // Slug grammar: ^[a-z0-9][a-z0-9_-]{0,63}$
+    if d.len() > 64 {
+        return Err(format!(
+            "persona event `d` tag too long ({} chars, max 64)",
+            d.len()
+        ));
+    }
+    let bytes = d.as_bytes();
+    if !bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit() {
+        return Err(
+            "persona event `d` tag must start with a lowercase letter or digit".to_string(),
+        );
+    }
+    if !bytes[1..]
+        .iter()
+        .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return Err(
+            "persona event `d` tag must match [a-z0-9_-] after the first character".to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Validate that `content` is a syntactically plausible NIP-44 v2 ciphertext.
 ///
 /// Checks:
@@ -1367,6 +1417,12 @@ pub async fn ingest_event(
     // ── 15a. Agent engram envelope (kind:30174) ──────────────────────────
     if kind_u32 == KIND_AGENT_ENGRAM {
         validate_engram_envelope(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+    }
+
+    // ── 15b. Persona envelope (kind:30175) ──────────────────────────────
+    if kind_u32 == KIND_PERSONA {
+        validate_persona_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
@@ -2284,5 +2340,98 @@ mod tests {
         let ev = make_engram(&[&["d", &d], &["p", &p]], &bad);
         let err = validate_engram_envelope(&ev).unwrap_err();
         assert!(err.contains("base64"), "got: {err}");
+    }
+
+    // ── NIP-AP persona envelope validation ───────────────────────────────
+
+    fn make_persona(tags: &[&[&str]]) -> Event {
+        make_event_with_tags(
+            KIND_PERSONA,
+            r#"{"display_name":"x","system_prompt":"y"}"#,
+            tags,
+        )
+    }
+
+    #[test]
+    fn persona_envelope_accepts_valid_slug() {
+        let ev = make_persona(&[&["d", "my-persona-1"]]);
+        assert!(validate_persona_envelope(&ev).is_ok());
+    }
+
+    #[test]
+    fn persona_envelope_accepts_single_char() {
+        let ev = make_persona(&[&["d", "a"]]);
+        assert!(validate_persona_envelope(&ev).is_ok());
+    }
+
+    #[test]
+    fn persona_envelope_accepts_max_length() {
+        let slug = "a".repeat(64);
+        let ev = make_persona(&[&["d", &slug]]);
+        assert!(validate_persona_envelope(&ev).is_ok());
+    }
+
+    #[test]
+    fn persona_envelope_rejects_missing_d_tag() {
+        let ev = make_persona(&[]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("`d` tag"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_empty_d_tag() {
+        let ev = make_persona(&[&["d", ""]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("must not be empty"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_duplicate_d_tags() {
+        let ev = make_persona(&[&["d", "slug-a"], &["d", "slug-b"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("`d` tag"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_too_long() {
+        let slug = "a".repeat(65);
+        let ev = make_persona(&[&["d", &slug]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("too long"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_uppercase() {
+        let ev = make_persona(&[&["d", "My-Persona"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("`d` tag"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_leading_underscore() {
+        let ev = make_persona(&[&["d", "_invalid"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("start with"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_leading_hyphen() {
+        let ev = make_persona(&[&["d", "-invalid"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("start with"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_spaces() {
+        let ev = make_persona(&[&["d", "has space"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("`d` tag"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_envelope_rejects_dots() {
+        let ev = make_persona(&[&["d", "has.dot"]]);
+        let err = validate_persona_envelope(&ev).unwrap_err();
+        assert!(err.contains("`d` tag"), "got: {err}");
     }
 }
