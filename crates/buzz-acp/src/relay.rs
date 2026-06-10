@@ -1647,7 +1647,7 @@ async fn handle_ws_message(
                             return true;
                         }
                         let ts = event.created_at.as_secs();
-                        let sprout_event = BuzzEvent {
+                        let buzz_event = BuzzEvent {
                             channel_id: channel_uuid,
                             event: *event,
                         };
@@ -1661,7 +1661,7 @@ async fn handle_ws_message(
                                 "event channel at ≥80% capacity — backpressure imminent"
                             );
                         }
-                        match event_tx.try_send(Some(sprout_event)) {
+                        match event_tx.try_send(Some(buzz_event)) {
                             Ok(()) => {
                                 state.membership_last_seen =
                                     Some(state.membership_last_seen.unwrap_or(0).max(ts));
@@ -1690,7 +1690,7 @@ async fn handle_ws_message(
                         let ts = event.created_at.as_secs();
                         let event_id_hex = event.id.to_hex();
                         if state.record_event(channel_id, &event) {
-                            let sprout_event = BuzzEvent {
+                            let buzz_event = BuzzEvent {
                                 channel_id,
                                 event: *event,
                             };
@@ -1704,7 +1704,7 @@ async fn handle_ws_message(
                                     "event channel at ≥80% capacity — backpressure imminent"
                                 );
                             }
-                            match event_tx.try_send(Some(sprout_event)) {
+                            match event_tx.try_send(Some(buzz_event)) {
                                 Ok(()) => {}
                                 Err(mpsc::error::TrySendError::Full(_)) => {
                                     // Remove from dedup set so the replayed event
